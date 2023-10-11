@@ -11,7 +11,6 @@
 #include "pin_mux.h"
 #include "clock_config.h"
 #include "board.h"
-#include "fsl_ftm.h"
 
 /*******************************************************************************
  * Definitions
@@ -28,22 +27,6 @@
 /* Fix MISRA_C-2012 Rule 17.7. */
 #define LOG_INFO (void)PRINTF
 
-//FTM
-#define FTM_BASEADDR FTM0
-#define FTM_CHANNEL  kFTM_Chnl_1
-#define PWM_FREQUENCY (24000U)
-#define FTM_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_BusClk)
-#define FTM_CHANNEL_INTERRUPT_ENABLE kFTM_Chnl1InterruptEnable
-#define FTM_CHANNEL_FLAG             kFTM_Chnl1Flag
-
-#define RED_LED_GPIO     GPIOB
-#define RED_LED_GPIO_PIN 22
-
-#define BLUE_LED_GPIO     GPIOB
-#define BLUE_LED_GPIO_PIN 21
-
-#define GREEN_LED_GPIO     GPIOE
-#define GREEN_LED_GPIO_PIN 26
 
 /*******************************************************************************
  * Prototypes
@@ -73,9 +56,6 @@ void delay(void);
 /*******************************************************************************
  * Variables
  ******************************************************************************/
-volatile bool ftmIsrFlag          = false;
-volatile bool brightnessUp        = true; /* Indicate LED is brighter or dimmer */
-volatile uint8_t updatedDutycycle = 10U;
 
 /******************** ***********************************************************
  * Code
@@ -88,47 +68,6 @@ void delay(void)
         __asm("NOP"); /* delay */
     }
 }
-
-void FTM0_IRQHandler(void)
-{
-    ftmIsrFlag = true;
-
-    if (brightnessUp)
-    {
-        /* Increase duty cycle until it reach limited value, don't want to go upto 100% duty cycle
-         * as channel interrupt will not be set for 100%
-         */
-        if (++updatedDutycycle >= 99U)
-        {
-            updatedDutycycle = 99U;
-            brightnessUp     = false;
-        }
-    }
-    else
-    {
-        /* Decrease duty cycle until it reach limited value */
-        if (--updatedDutycycle == 1U)
-        {
-            brightnessUp = true;
-        }
-    }
-
-    /* Clear interrupt flag.*/
-    FTM_ClearStatusFlags(FTM_BASEADDR, FTM_GetStatusFlags(FTM_BASEADDR));
-
-    __DSB();
-}
-
-typedef enum{
-    RED,
-    YELLOW,
-    GREEN,
-    CYAN,
-    BLUE,
-    PURPLE,
-    WHITE,
-    NO_COLOR
-}color_t;
 
 static FLEXCAN_CALLBACK(flexcan_callback)
 {
@@ -154,7 +93,6 @@ static FLEXCAN_CALLBACK(flexcan_callback)
             break;
     }
 }
-void RGB_color(color_t color);
 
 /*!
  * @brief Main function
@@ -163,54 +101,13 @@ int main(void)
 {
     flexcan_config_t flexcanConfig;
     flexcan_rx_mb_config_t mbConfig;
-    ftm_config_t ftmInfo;
-    ftm_chnl_pwm_signal_param_t ftmParam;
-    ftm_pwm_level_select_t pwmLevel = kFTM_HighTrue;
-    gpio_pin_config_t red_led_config = {
-        kGPIO_DigitalOutput,
-        0,
-    };
-    gpio_pin_config_t green_led_config = {
-        kGPIO_DigitalOutput,
-        0,
-    };
-    gpio_pin_config_t blue_led_config = {
-        kGPIO_DigitalOutput,
-        0,
-    };
 
     /* Initialize board hardware. */
     BOARD_InitBootPins();
     BOARD_InitBootClocks();
     BOARD_InitDebugConsole();
-    GPIO_PinInit(RED_LED_GPIO, RED_LED_GPIO_PIN, &red_led_config);
-    GPIO_PinInit(BLUE_LED_GPIO, BLUE_LED_GPIO_PIN, &green_led_config);
-    GPIO_PinInit(GREEN_LED_GPIO, GREEN_LED_GPIO_PIN, &blue_led_config);
 
     LOG_INFO("\r\n==FlexCAN loopback example -- Start.==\r\n\r\n");
-    //PWM INIT
-    /* Fill in the FTM config struct with the default settings */
-    FTM_GetDefaultConfig(&ftmInfo);
-    /* Calculate the clock division based on the PWM frequency to be obtained */
-    ftmInfo.prescale = FTM_CalculateCounterClkDiv(FTM_BASEADDR, PWM_FREQUENCY, FTM_SOURCE_CLOCK);
-    /* Initialize FTM module */
-    FTM_Init(FTM_BASEADDR, &ftmInfo);
-
-    /* Configure ftm params with frequency 24kHZ */
-    ftmParam.chnlNumber            = FTM_CHANNEL;
-    ftmParam.level                 = pwmLevel;
-    ftmParam.dutyCyclePercent      = updatedDutycycle;
-    ftmParam.firstEdgeDelayPercent = 0U;
-    ftmParam.enableComplementary   = false;
-    ftmParam.enableDeadtime        = false;
-    if (kStatus_Success !=
-        FTM_SetupPwm(FTM_BASEADDR, &ftmParam, 1U, kFTM_CenterAlignedPwm, PWM_FREQUENCY, FTM_SOURCE_CLOCK))
-    {
-        PRINTF("\r\nSetup PWM fail, please check the configuration parameters!\r\n");
-        return -1;
-    }
-
-    FTM_StartTimer(FTM_BASEADDR, kFTM_SystemClock);
 
 
     //PWM INIT
@@ -379,72 +276,5 @@ int main(void)
         LOG_INFO("rx word0 = 0x%x\r\n", rxFrame.dataWord0);
         LOG_INFO("rx word1 = 0x%x\r\n", rxFrame.dataWord1);
         LOG_INFO("rx id = 0x%x\r\n", rxFrame.id);
-
-        if(rxFrame.id >> 18 == 3)
-        {
-            updatedDutycycle = (rxFrame.dataWord0>>16 ) % 256;
-
-            FTM_UpdateChnlEdgeLevelSelect(FTM_BASEADDR, FTM_CHANNEL, 0U);
-            if (kStatus_Success !=
-                FTM_UpdatePwmDutycycle(FTM_BASEADDR, FTM_CHANNEL, kFTM_CenterAlignedPwm, (updatedDutycycle%100)))
-            {
-                PRINTF("Update duty cycle fail, the target duty cycle may out of range!\r\n");
-            }
-            /* Software trigger to update registers */
-            FTM_SetSoftwareTrigger(FTM_BASEADDR, true);
-            /* Start channel output with updated dutycycle */
-            FTM_UpdateChnlEdgeLevelSelect(FTM_BASEADDR, FTM_CHANNEL, pwmLevel);
-
-            RGB_color(((rxFrame.dataWord0>>24) % 256) % NO_COLOR);
-        }
-
-
     }
-}
-
-void RGB_color(color_t color)
-{
-	switch(color)
-	{
-		case RED:
-			GPIO_PortClear(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortSet(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortSet(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case YELLOW:
-			GPIO_PortClear(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortClear(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortSet(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case GREEN:
-			GPIO_PortSet(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortClear(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortSet(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case CYAN:
-			GPIO_PortSet(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortClear(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortClear(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case BLUE:
-			GPIO_PortSet(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortSet(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortClear(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case PURPLE:
-			GPIO_PortClear(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortSet(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortClear(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case WHITE:
-			GPIO_PortClear(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortClear(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortClear(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-		case NO_COLOR:
-			GPIO_PortSet(RED_LED_GPIO, 1u << RED_LED_GPIO_PIN );
-			GPIO_PortSet(GREEN_LED_GPIO, 1u << GREEN_LED_GPIO_PIN );
-			GPIO_PortSet(BLUE_LED_GPIO, 1u << BLUE_LED_GPIO_PIN );
-		break;
-	}
 }
